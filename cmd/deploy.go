@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 
+	"github.com/ququzone/ckb-sdk-go/crypto/blake2b"
 	"github.com/ququzone/ckb-sdk-go/crypto/secp256k1"
 	"github.com/ququzone/ckb-sdk-go/rpc"
 	"github.com/ququzone/ckb-sdk-go/transaction"
@@ -15,9 +16,10 @@ import (
 )
 
 var (
-	deployURL  *string
-	deployKey  *string
-	deployFile *string
+	deployURL    *string
+	deployKey    *string
+	deployFile   *string
+	deployMethod *string
 )
 
 var deployCmd = &cobra.Command{
@@ -57,6 +59,8 @@ var deployCmd = &cobra.Command{
 			Fatalf("load system script error: %v", err)
 		}
 
+		var codeHash types.Hash
+
 		change, err := key.Script(scripts)
 
 		capacity := uint64(dataInfo.Size()+61+65) * uint64(math.Pow10(8))
@@ -70,19 +74,33 @@ var deployCmd = &cobra.Command{
 			Fatalf("insufficient capacity: %d < %d", cells.Capacity, capacity+100000000)
 		}
 
-		typeIdScript, err := BuildTypeIdScript(&types.CellInput{
-			Since:          0,
-			PreviousOutput: cells.Cells[0].OutPoint,
-		}, 0)
-		if err != nil {
-			Fatalf("build typeId script error: %v", err)
-		}
 		tx := transaction.NewSecp256k1SingleSigTx(scripts)
 		tx.Outputs = append(tx.Outputs, &types.CellOutput{
 			Capacity: uint64(capacity),
 			Lock:     change,
-			Type:     typeIdScript,
 		})
+
+		if *deployMethod == "typeID" {
+			typeIdScript, err := BuildTypeIdScript(&types.CellInput{
+				Since:          0,
+				PreviousOutput: cells.Cells[0].OutPoint,
+			}, 0)
+			if err != nil {
+				Fatalf("build typeId script error: %v", err)
+			}
+			tx.Outputs[0].Type = typeIdScript
+			codeHash, err = typeIdScript.Hash()
+			if err != nil {
+				Fatalf("CodeHash error")
+			}
+		} else {
+			bytes, err := blake2b.Blake256(data)
+			if err != nil {
+				Fatalf("CodeHash error")
+			}
+			codeHash = types.BytesToHash(bytes)
+		}
+
 		tx.OutputsData = append(tx.OutputsData, data)
 
 		if cells.Capacity-capacity-100000000 > 61 {
@@ -98,7 +116,7 @@ var deployCmd = &cobra.Command{
 			Fatalf("add inputs to transaction error: %v", err)
 		}
 
-		fee, err := transaction.CalculateTransactionFee(tx, 1000)
+		fee, err := transaction.CalculateTransactionFee(tx, 1100)
 		if err != nil {
 			Fatalf("calculate transaction fee error: %v", err)
 		}
@@ -119,12 +137,11 @@ var deployCmd = &cobra.Command{
 			Fatalf("send transaction error: %v", err)
 		}
 
-		typeIdHash, _ := typeIdScript.Hash()
 		fmt.Printf(`Deployed script info:
 	txHash: %s
 	index: 0
-	typeId: %s
-`, hash.String(), typeIdHash)
+	CodeHash: %s
+`, hash.String(), codeHash)
 	},
 }
 
@@ -134,6 +151,7 @@ func init() {
 	deployURL = deployCmd.Flags().StringP("url", "u", "http://localhost:8114", "RPC API server url")
 	deployKey = deployCmd.Flags().StringP("key", "k", "", "Deploy private key")
 	deployFile = deployCmd.Flags().StringP("binary", "b", "", "Compiled script binary file path")
+	deployMethod = deployCmd.Flags().StringP("method", "m", "", "Deploy method data or typeID")
 	_ = deployCmd.MarkFlagRequired("key")
 	_ = deployCmd.MarkFlagRequired("binary")
 }
