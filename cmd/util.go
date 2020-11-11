@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ququzone/ckb-sdk-go/crypto/blake2b"
-	"github.com/ququzone/ckb-sdk-go/types"
+	"github.com/nervosnetwork/ckb-sdk-go/crypto/blake2b"
+	"github.com/nervosnetwork/ckb-sdk-go/types"
 )
 
 const (

@@ -3,21 +3,25 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/nervosnetwork/ckb-sdk-go/indexer"
 	"math"
 	"os"
 
-	"github.com/ququzone/ckb-sdk-go/crypto/secp256k1"
-	"github.com/ququzone/ckb-sdk-go/rpc"
-	"github.com/ququzone/ckb-sdk-go/transaction"
-	"github.com/ququzone/ckb-sdk-go/types"
-	"github.com/ququzone/ckb-sdk-go/utils"
+	"github.com/nervosnetwork/ckb-sdk-go/crypto/blake2b"
+	"github.com/nervosnetwork/ckb-sdk-go/crypto/secp256k1"
+	"github.com/nervosnetwork/ckb-sdk-go/rpc"
+	"github.com/nervosnetwork/ckb-sdk-go/transaction"
+	"github.com/nervosnetwork/ckb-sdk-go/types"
+	"github.com/nervosnetwork/ckb-sdk-go/utils"
 	"github.com/spf13/cobra"
 )
 
 var (
-	deployURL  *string
-	deployKey  *string
-	deployFile *string
+	deployURL    *string
+	deployKey    *string
+	deployFile   *string
+	deployMethod *string
+	indexerURL   *string
 )
 
 var deployCmd = &cobra.Command{
@@ -42,7 +46,7 @@ var deployCmd = &cobra.Command{
 			Fatalf("read script binary  error: %v", err)
 		}
 
-		client, err := rpc.Dial(*deployURL)
+		client, err := rpc.DialWithIndexer(*deployURL, *indexerURL)
 		if err != nil {
 			Fatalf("create rpc client error: %v", err)
 		}
@@ -57,56 +61,82 @@ var deployCmd = &cobra.Command{
 			Fatalf("load system script error: %v", err)
 		}
 
+		var codeHash types.Hash
+
 		change, err := key.Script(scripts)
 
 		capacity := uint64(dataInfo.Size()+61+65) * uint64(math.Pow10(8))
+		searchKey := &indexer.SearchKey{
+			Script:     change,
+			ScriptType: indexer.ScriptTypeLock,
+		}
 
-		cellCollector := utils.NewCellCollector(client, change, utils.NewCapacityCellProcessor(capacity+100000000))
-		cells, err := cellCollector.Collect()
+		cellCollector := utils.NewLiveCellCollector(client, searchKey, indexer.SearchOrderAsc, 1000, "", utils.NewCapacityLiveCellProcessor(capacity+100000000))
+		result, err := cellCollector.Collect()
 		if err != nil {
 			Fatalf("collect cell error: %v", err)
 		}
-		if cells.Capacity < capacity+100000000 {
-			Fatalf("insufficient capacity: %d < %d", cells.Capacity, capacity+100000000)
+		if result.Capacity < capacity+100000000 {
+			Fatalf("insufficient capacity: %d < %d", result.Capacity, capacity+100000000)
 		}
 
-		typeIdScript, err := BuildTypeIdScript(&types.CellInput{
-			Since:          0,
-			PreviousOutput: cells.Cells[0].OutPoint,
-		}, 0)
-		if err != nil {
-			Fatalf("build typeId script error: %v", err)
-		}
 		tx := transaction.NewSecp256k1SingleSigTx(scripts)
 		tx.Outputs = append(tx.Outputs, &types.CellOutput{
 			Capacity: uint64(capacity),
 			Lock:     change,
-			Type:     typeIdScript,
 		})
+
+		if *deployMethod == "typeID" {
+			typeIdScript, err := BuildTypeIdScript(&types.CellInput{
+				Since:          0,
+				PreviousOutput: result.LiveCells[0].OutPoint,
+			}, 0)
+			if err != nil {
+				Fatalf("build typeId script error: %v", err)
+			}
+			tx.Outputs[0].Type = typeIdScript
+			codeHash, err = typeIdScript.Hash()
+			if err != nil {
+				Fatalf("CodeHash error")
+			}
+		} else {
+			bytes, err := blake2b.Blake256(data)
+			if err != nil {
+				Fatalf("CodeHash error")
+			}
+			codeHash = types.BytesToHash(bytes)
+		}
+
 		tx.OutputsData = append(tx.OutputsData, data)
 
-		if cells.Capacity-capacity-100000000 > 61 {
+		if result.Capacity-capacity-100000000 > 6100000000 {
 			tx.Outputs = append(tx.Outputs, &types.CellOutput{
 				Capacity: 0,
 				Lock:     change,
 			})
 			tx.OutputsData = append(tx.OutputsData, []byte{})
 		}
-
-		group, witnessArgs, err := transaction.AddInputsForTransaction(tx, cells.Cells)
+		var inputs []*types.CellInput
+		for _, cell := range result.LiveCells {
+			inputs = append(inputs, &types.CellInput{
+				Since:          0,
+				PreviousOutput: cell.OutPoint,
+			})
+		}
+		group, witnessArgs, err := transaction.AddInputsForTransaction(tx, inputs)
 		if err != nil {
 			Fatalf("add inputs to transaction error: %v", err)
 		}
 
-		fee, err := transaction.CalculateTransactionFee(tx, 1000)
+		fee, err := transaction.CalculateTransactionFee(tx, 1100)
 		if err != nil {
 			Fatalf("calculate transaction fee error: %v", err)
 		}
 
 		if len(tx.Outputs) > 1 {
-			tx.Outputs[1].Capacity = cells.Capacity - capacity - fee
+			tx.Outputs[1].Capacity = result.Capacity - capacity - fee
 		} else {
-			tx.Outputs[0].Capacity = cells.Capacity - fee
+			tx.Outputs[0].Capacity = result.Capacity - fee
 		}
 
 		err = transaction.SingleSignTransaction(tx, group, witnessArgs, key)
@@ -119,12 +149,11 @@ var deployCmd = &cobra.Command{
 			Fatalf("send transaction error: %v", err)
 		}
 
-		typeIdHash, _ := typeIdScript.Hash()
 		fmt.Printf(`Deployed script info:
 	txHash: %s
 	index: 0
-	typeId: %s
-`, hash.String(), typeIdHash)
+	CodeHash: %s
+`, hash.String(), codeHash)
 	},
 }
 
@@ -132,8 +161,10 @@ func init() {
 	rootCmd.AddCommand(deployCmd)
 
 	deployURL = deployCmd.Flags().StringP("url", "u", "http://localhost:8114", "RPC API server url")
+	indexerURL = deployCmd.Flags().StringP("indexerUrl", "i", "http://localhost:8116", "ckb-indexer url")
 	deployKey = deployCmd.Flags().StringP("key", "k", "", "Deploy private key")
 	deployFile = deployCmd.Flags().StringP("binary", "b", "", "Compiled script binary file path")
+	deployMethod = deployCmd.Flags().StringP("method", "m", "", "Deploy method data or typeID")
 	_ = deployCmd.MarkFlagRequired("key")
 	_ = deployCmd.MarkFlagRequired("binary")
 }

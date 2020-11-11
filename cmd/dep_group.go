@@ -3,14 +3,15 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/nervosnetwork/ckb-sdk-go/indexer"
 	"io/ioutil"
 	"math"
 
-	"github.com/ququzone/ckb-sdk-go/crypto/secp256k1"
-	"github.com/ququzone/ckb-sdk-go/rpc"
-	"github.com/ququzone/ckb-sdk-go/transaction"
-	"github.com/ququzone/ckb-sdk-go/types"
-	"github.com/ququzone/ckb-sdk-go/utils"
+	"github.com/nervosnetwork/ckb-sdk-go/crypto/secp256k1"
+	"github.com/nervosnetwork/ckb-sdk-go/rpc"
+	"github.com/nervosnetwork/ckb-sdk-go/transaction"
+	"github.com/nervosnetwork/ckb-sdk-go/types"
+	"github.com/nervosnetwork/ckb-sdk-go/utils"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
 )
@@ -19,6 +20,7 @@ var (
 	depURL        *string
 	depKey        *string
 	depConfigFile *string
+	indexURL      *string
 )
 
 type DepGroupConfig struct {
@@ -57,7 +59,7 @@ var depCmd = &cobra.Command{
 		}
 		data := types.SerializeFixVec(deps)
 
-		client, err := rpc.Dial(*depURL)
+		client, err := rpc.DialWithIndexer(*depURL, *indexURL)
 		if err != nil {
 			Fatalf("create rpc client error: %v", err)
 		}
@@ -75,8 +77,12 @@ var depCmd = &cobra.Command{
 		change, err := key.Script(scripts)
 
 		capacity := uint64(len(data)+61) * uint64(math.Pow10(8))
+		searchKey := &indexer.SearchKey{
+			Script:     change,
+			ScriptType: indexer.ScriptTypeLock,
+		}
 
-		cellCollector := utils.NewCellCollector(client, change, utils.NewCapacityCellProcessor(capacity+100000000))
+		cellCollector := utils.NewLiveCellCollector(client, searchKey, indexer.SearchOrderAsc, 1000, "", utils.NewCapacityLiveCellProcessor(capacity+100000000))
 		cells, err := cellCollector.Collect()
 		if err != nil {
 			Fatalf("collect cell error: %v", err)
@@ -99,8 +105,14 @@ var depCmd = &cobra.Command{
 			})
 			tx.OutputsData = append(tx.OutputsData, []byte{})
 		}
-
-		group, witnessArgs, err := transaction.AddInputsForTransaction(tx, cells.Cells)
+		var inputs []*types.CellInput
+		for _, cell := range cells.LiveCells {
+			inputs = append(inputs, &types.CellInput{
+				Since:          0,
+				PreviousOutput: cell.OutPoint,
+			})
+		}
+		group, witnessArgs, err := transaction.AddInputsForTransaction(tx, inputs)
 		if err != nil {
 			Fatalf("add inputs to transaction error: %v", err)
 		}
@@ -137,6 +149,7 @@ func init() {
 	rootCmd.AddCommand(depCmd)
 
 	depURL = depCmd.Flags().StringP("url", "u", "http://localhost:8114", "RPC API server url")
+	indexURL = depCmd.Flags().StringP("indexUrl", "i", "http://localhost:8116", "ckb-indexer url")
 	depKey = depCmd.Flags().StringP("key", "k", "", "private key")
 	depConfigFile = depCmd.Flags().StringP("file", "f", "dep_group.yaml", "dep_group config file path")
 	_ = depCmd.MarkFlagRequired("key")
